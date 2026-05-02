@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BORIH 보리 · 2026.05.10 런칭</title>
+<meta name="description" content="차로 잇는 웰니스 라이프스타일 브랜드 BORIH가 2026년 5월 10일 런칭합니다. 보리에게 응원의 한 마디를 남겨주세요.">
+
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="BORIH 보리 · 2026.05.10 런칭">
+<meta property="og:description" content="차로 잇는 웰니스 라이프스타일 브랜드 BORIH가 2026년 5월 10일 런칭합니다.">
+<meta property="og:locale" content="ko_KR">
+
+<!-- Twitter Card -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="BORIH 보리 · 2026.05.10 런칭">
+<meta name="twitter:description" content="차로 잇는 웰니스 라이프스타일 브랜드 BORIH가 2026년 5월 10일 런칭합니다.">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;700&family=Noto+Serif+KR:wght@300;400;500&family=Cormorant+Garamond:ital,wght@0,300;0,400;1,300;1,400&display=swap" rel="stylesheet">
+
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    min-height: 100vh;
+    background: #e8e4dd;
+    font-family: 'Noto Serif KR', Georgia, 'Apple SD Gothic Neo', 'Malgun Gothic', serif;
+    color: #2c2b28;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 16px;
+  }
+
+  /* ── 엽서 카드 ── */
+  .postcard {
+    width: 100%;
+    max-width: 420px;
+    background: #faf8f4;
+    box-shadow: 0 24px 60px -20px rgba(60, 70, 50, 0.18), 0 4px 16px -4px rgba(60, 70, 50, 0.08);
+    overflow: hidden;
+  }
+
+  /* ── 상단 Sage Deep 헤더 ── */
+  .header {
+    background: #5d7a5a;
+    padding: 38px 36px 32px;
+    text-align: center;
+    position: relative;
+  }
+
+  .series-strip {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 28px;
+    font-family: 'Poppins', 'Century Gothic', Futura, sans-serif;
+    font-size: 9.5px;
+    font-weight: 300;
+    letter-spacing: 0.3em;
+    color: rgba(255, 255, 255, 0.7);
+    text-transform: uppercase;
+  }
+
+  .brand-logo {
+    font-family: 'Poppins', 'Century Gothic', Futura, sans-serif;
+    font-weight: 700;
+    font-size: 32px;
+    letter-spacing: 0.18em;
+    color: #ffffff;
+    line-height: 1;
+    margin-bottom: 10px;
+  }
+
+  .brand-tagline {
+    font-family: 'Cormorant Garamond', Garamond, Georgia, serif;
+    font-weight: 300;
+    font-style: italic;
+    font-size: 13px;
+    letter-spacing: 0.18em;
+    color: rgba(255, 255, 255, 0.6);
+  }
+
+  .header-divider {
+    width: 28px;
+    height: 1px;
+    background: rgba(255, 255, 255, 0.3);
+    margin: 22px auto 0;
+  }
+
+  /* ── 본문 영역 ── */
+  .body {
+    padding: 38px 36px 32px;
+    background: #faf8f4;
+  }
+
+  .eyebrow {
+    text-align: center;
+    font-family: 'Poppins', sans-serif;
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0.4em;
+    color: #5d7a5a;
+    text-transform: uppercase;
+    margin-bottom: 20px;
+  }
+
+  .headline {
+    text-align: center;
+    font-family: 'Noto Serif KR', serif;
+    font-size: 22px;
+    font-weight: 400;
+    color: #2c2b28;
+    line-height: 1.55;
+    letter-spacing: 0.02em;
+    margin-bottom: 28px;
+  }
+
+  .headline strong {
+    font-weight: 500;
+    color: #5d7a5a;
+  }
+
+  /* 날짜 강조 */
+  .date-block {
+    text-align: center;
+    background: #f5f1eb;
+    border-top: 1px solid #d4cfc6;
+    border-bottom: 1px solid #d4cfc6;
+    padding: 22px 16px;
+    margin-bottom: 28px;
+  }
+
+  .date-label {
+    font-family: 'Poppins', sans-serif;
+    font-size: 9.5px;
+    font-weight: 400;
+    letter-spacing: 0.4em;
+    color: #9a9590;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .date-main {
+    font-family: 'Poppins', 'Century Gothic', Futura, sans-serif;
+    font-weight: 300;
+    font-size: 28px;
+    letter-spacing: 0.08em;
+    color: #5d7a5a;
+    line-height: 1.1;
+    margin-bottom: 6px;
+  }
+
+  .date-sub {
+    font-family: 'Noto Serif KR', serif;
+    font-size: 12px;
+    font-weight: 300;
+    letter-spacing: 0.05em;
+    color: #5a5750;
+  }
+
+  .message {
+    font-family: 'Noto Serif KR', serif;
+    font-size: 13.5px;
+    font-weight: 300;
+    line-height: 1.95;
+    letter-spacing: 0.03em;
+    color: #5a5750;
+    text-align: center;
+    margin-bottom: 32px;
+  }
+
+  .msg-lead {
+    display: inline-block;
+    font-family: 'Noto Serif KR', serif;
+    font-size: 15px;
+    font-weight: 500;
+    color: #2c2b28;
+    letter-spacing: 0.03em;
+    line-height: 1.7;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #bccdb7;
+  }
+
+  .msg-tagline {
+    display: inline-block;
+    font-family: 'Cormorant Garamond', Garamond, Georgia, serif;
+    font-style: italic;
+    font-size: 14px;
+    font-weight: 400;
+    color: #5d7a5a;
+    letter-spacing: 0.04em;
+    line-height: 1.8;
+  }
+
+  /* ── 응원 메시지 안내 ── */
+  .invite-block {
+    background: #f5f1eb;
+    border-left: 2px solid #8fa68a;
+    padding: 18px 20px;
+    margin-bottom: 26px;
+  }
+
+  .invite-eyebrow {
+    font-family: 'Poppins', sans-serif;
+    font-size: 9px;
+    font-weight: 400;
+    letter-spacing: 0.35em;
+    color: #5d7a5a;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .invite-text {
+    font-family: 'Noto Serif KR', serif;
+    font-size: 13px;
+    font-weight: 300;
+    line-height: 1.8;
+    letter-spacing: 0.03em;
+    color: #2c2b28;
+  }
+
+  .invite-text em {
+    font-style: normal;
+    font-weight: 500;
+    color: #5d7a5a;
+  }
+
+  /* ── CTA 버튼 ── */
+  .cta-wrap {
+    text-align: center;
+    margin-bottom: 4px;
+  }
+
+  .cta-button {
+    display: inline-block;
+    background: #5d7a5a;
+    color: #ffffff;
+    text-decoration: none;
+    font-family: 'Poppins', sans-serif;
+    font-size: 11.5px;
+    font-weight: 400;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    padding: 16px 40px;
+    transition: background 0.2s ease;
+  }
+
+  .cta-button:hover {
+    background: #4a6347;
+  }
+
+  .cta-sub {
+    margin-top: 14px;
+    font-family: 'Poppins', sans-serif;
+    font-size: 10px;
+    font-weight: 300;
+    letter-spacing: 0.18em;
+    color: #9a9590;
+  }
+
+  /* ── 보조 CTA (홈페이지) ── */
+  .secondary-cta-wrap {
+    text-align: center;
+    margin-top: 28px;
+    padding-top: 24px;
+    border-top: 1px solid #e8e4dd;
+  }
+
+  .secondary-cta-label {
+    font-family: 'Noto Serif KR', serif;
+    font-size: 12.5px;
+    font-weight: 300;
+    letter-spacing: 0.04em;
+    color: #5a5750;
+    margin-bottom: 14px;
+  }
+
+  .secondary-cta-button {
+    display: inline-block;
+    background: transparent;
+    color: #5d7a5a;
+    text-decoration: none;
+    font-family: 'Poppins', sans-serif;
+    font-size: 10.5px;
+    font-weight: 400;
+    letter-spacing: 0.25em;
+    text-transform: uppercase;
+    padding: 12px 28px;
+    border: 1px solid #8fa68a;
+    transition: background 0.2s ease, color 0.2s ease;
+  }
+
+  .secondary-cta-button:hover {
+    background: #5d7a5a;
+    color: #ffffff;
+    border-color: #5d7a5a;
+  }
+
+  /* ── 하단 ── */
+  .footer {
+    padding: 22px 36px 28px;
+    background: #faf8f4;
+    border-top: 1px solid #e8e4dd;
+    text-align: center;
+  }
+
+  .footer-brand {
+    font-family: 'Poppins', sans-serif;
+    font-weight: 700;
+    font-size: 12px;
+    letter-spacing: 0.22em;
+    color: #5d7a5a;
+    margin-bottom: 4px;
+  }
+
+  .footer-meta {
+    font-family: 'Poppins', sans-serif;
+    font-size: 9.5px;
+    font-weight: 300;
+    letter-spacing: 0.18em;
+    color: #9a9590;
+    line-height: 1.7;
+  }
+
+  .footer-meta a {
+    color: #9a9590;
+    text-decoration: none;
+  }
+
+  /* ── 모바일 ── */
+  @media (max-width: 480px) {
+    body { padding: 20px 12px; }
+    .header { padding: 32px 28px 28px; }
+    .brand-logo { font-size: 28px; }
+    .body { padding: 32px 28px 28px; }
+    .headline { font-size: 19px; }
+    .date-main { font-size: 24px; }
+    .footer { padding: 20px 28px 24px; }
+  }
+
+  /* 더 작은 화면 */
+  @media (max-width: 360px) {
+    .series-strip { font-size: 8.5px; letter-spacing: 0.22em; }
+    .headline { font-size: 17px; }
+    .cta-button { font-size: 10.5px; letter-spacing: 0.22em; padding: 14px 28px; }
+    .secondary-cta-button { font-size: 9.5px; letter-spacing: 0.2em; padding: 11px 22px; }
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<div class="postcard">
+
+  <!-- ── 상단 Sage Deep 헤더 ── -->
+  <div class="header">
+    <div class="series-strip">
+      <span>Spring 2026</span>
+      <span>Vol. 01</span>
+    </div>
+    <div class="brand-logo">BORIH</div>
+    <div class="brand-tagline">The Art of Being Well</div>
+    <div class="header-divider"></div>
+  </div>
+
+  <!-- ── 본문 ── -->
+  <div class="body">
+
+    <div class="eyebrow">Launch Notice</div>
+
+    <div class="headline">
+      보리, <strong>2026년 5월 10일</strong><br>
+      시작합니다
+    </div>
+
+    <!-- 날짜 -->
+    <div class="date-block">
+      <div class="date-label">Launching</div>
+      <div class="date-main">2026 . 05 . 10</div>
+      <div class="date-sub">일요일 · 오후 2시 30분</div>
+    </div>
+
+    <div class="message">
+      <strong class="msg-lead">차로 잇는 웰니스 라이프스타일.</strong><br><br>
+      보리는 차 한 잔의 입구에서 시작해<br>
+      콘텐츠로 마음을 잇고, 경험으로 몸에 새기고,<br>
+      일상으로 넓혀가는<br>
+      웰니스 여정을 만들어갑니다.<br><br>
+      <em class="msg-tagline">The Art of Being Well —<br>
+      오늘도 흔들리지만, 오늘도 나아갑니다.</em>
+    </div>
+
+    <!-- 응원 메시지 안내 -->
+    <div class="invite-block">
+      <div class="invite-eyebrow">Your Message</div>
+      <div class="invite-text">
+        보리의 시작에 <em>응원의 한 마디</em>를<br>
+        남겨주세요. 당신의 마음이<br>
+        보리가 피어나는 자리를 더 따뜻하게 합니다.
+      </div>
+    </div>
+
+    <!-- CTA -->
+    <div class="cta-wrap">
+      <a href="https://tally.so/r/yPe9b6" target="_blank" rel="noopener" class="cta-button">
+        응원 메시지 남기기 →
+      </a>
+      <div class="cta-sub">1분이면 충분합니다</div>
+    </div>
+
+    <!-- Secondary CTA: 홈페이지 -->
+    <div class="secondary-cta-wrap">
+      <div class="secondary-cta-label">보리에 대해 더 알고 싶다면</div>
+      <a href="https://borih-official.github.io/pro/" target="_blank" rel="noopener" class="secondary-cta-button">
+        BORIH 홈페이지 →
+      </a>
+    </div>
+
+  </div>
+
+  <!-- ── Footer ── -->
+  <div class="footer">
+    <div class="footer-brand">BORIH</div>
+    <div class="footer-meta">
+      <a href="https://borih.kr" target="_blank" rel="noopener">borih.kr</a>
+      &nbsp;·&nbsp;
+      <a href="https://instagram.com/borih.official" target="_blank" rel="noopener">@borih.official</a>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
